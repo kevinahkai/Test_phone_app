@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>手勢疊方塊 AR</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: #222; font-family: sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; transform: scaleX(-1); /* 鏡像翻轉 */ }
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; display: flex; justify-content: center; align-items: flex-start;
+        }
+        #score-board {
+            margin-top: 20px; color: white; font-size: 24px; font-weight: bold; 
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5); z-index: 10;
+        }
+        #video-feed { display: none; } /* 隱藏原始影片，只顯示 Canvas */
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div id="score-board">高度: 0 | 狀態: 請捏合手指</div>
+    </div>
+    <video id="video-feed" playsinline></video>
+    <canvas id="output-canvas"></canvas>
+
+<script>
+    const videoElement = document.getElementById('video-feed');
+    const canvasElement = document.getElementById('output-canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const scoreBoard = document.getElementById('score-board');
+
+    // 遊戲狀態變數
+    let pinchStartTime = 0;
+    let isPinching = false;
+    let currentBlock = null;
+    let staticBlocks = []; // 已經疊好的方塊
+    const PINCH_THRESHOLD = 0.05; // 捏合距離閾值
+    const LOAD_TIME = 1500; // 1.5秒
+    const BLOCK_SIZE = 80;
+    let score = 0;
+    
+    // 手指座標
+    let thumbTip = {x: 0, y: 0};
+    let indexTip = {x: 0, y: 0};
+    let pinchCenter = {x: 0, y: 0};
+
+    // 初始化 Canvas 大小
+    function resizeCanvas() {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // MediaPipe Hands 設定
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7
+    });
+
+    hands.onResults(onResults);
+
+    // 啟動相機
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 1280,
+        height: 720
+    });
+    camera.start();
+
+    // 核心邏輯 Loop
+    function onResults(results) {
+        // 清除畫布
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        
+        // 繪製相機畫面 (背景)
+        canvasCtx.save();
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        
+        // 處理方塊邏輯 (包含掉落動畫)
+        updateGamePhysics();
+        drawBlocks();
+
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const landmarks = results.multiHandLandmarks[0];
+            
+            // 取得大拇指 (4) 和食指 (8) 的座標
+            // MediaPipe 座標是 0-1 的比例，需轉換成 Canvas 像素
+            thumbTip = { x: landmarks[4].x * canvasElement.width, y: landmarks[4].y * canvasElement.height };
+            indexTip = { x: landmarks[8].x * canvasElement.width, y: landmarks[8].y * canvasElement.height };
+            
+            // 計算捏合中心點
+            pinchCenter = {
+                x: (thumbTip.x + indexTip.x) / 2,
+                y: (thumbTip.y + indexTip.y) / 2
+            };
+
+            // 繪製手指關鍵點 (視覺輔助)
+            drawHandPoints(thumbTip, indexTip);
+
+            // 計算距離 (歐幾里得距離)
+            // 因為 canvas 寬高不同，這裡簡化使用標準化座標計算距離會比較準確
+            const dist = Math.hypot(landmarks[4].x - landmarks[8].x, landmarks[4].y - landmarks[8].y);
+
+            // 判斷捏合
+            if (dist < PINCH_THRESHOLD) {
+                if (!isPinching) {
+                    isPinching = true;
+                    pinchStartTime = Date.now();
+                }
+                handlePinchHold();
+            } else {
+                if (isPinching) {
+                    handleRelease();
+                }
+                isPinching = false;
+                pinchStartTime = 0;
+            }
+        }
+        canvasCtx.restore();
+    }
+
+    // 繪製手指點
+    function drawHandPoints(p1, p2) {
+        canvasCtx.fillStyle = '#00FF00';
+        canvasCtx.beginPath(); arc(p1.x, p1.y, 5); canvasCtx.fill();
+        canvasCtx.beginPath(); arc(p2.x, p2.y, 5); canvasCtx.fill();
+    }
+    
+    function arc(x, y, r) {
+        canvasCtx.arc(x, y, r, 0, 2 * Math.PI);
+    }
+
+    // 處理捏合持續狀態
+    function handlePinchHold() {
+        const elapsed = Date.now() - pinchStartTime;
+        const progress = Math.min(elapsed / LOAD_TIME, 1);
+
+        // 如果還沒生成方塊，顯示進度條
+        if (!currentBlock) {
+            scoreBoard.innerText = "生成中...";
+            // 畫圈圈進度條
+            canvasCtx.strokeStyle = 'white';
+            canvasCtx.lineWidth = 5;
+            canvasCtx.beginPath();
+            canvasCtx.arc(pinchCenter.x, pinchCenter.y, 30, -Math.PI/2, (-Math.PI/2) + (Math.PI * 2 * progress));
+            canvasCtx.stroke();
+
+            // 時間到，生成方塊
+            if (progress >= 1) {
+                currentBlock = {
+                    x: pinchCenter.x,
+                    y: pinchCenter.y,
+                    width: BLOCK_SIZE,
+                    height: BLOCK_SIZE,
+                    color: `hsl(${Math.random() * 360}, 70%, 50%)`,
+                    isFalling: false
+                };
+                scoreBoard.innerText = "方塊已抓取！移動到合適位置鬆開";
+            }
+        } else {
+            // 方塊已生成，跟隨手指移動
+            currentBlock.x = pinchCenter.x - (BLOCK_SIZE / 2); // 置中
+            currentBlock.y = pinchCenter.y - (BLOCK_SIZE / 2);
+        }
+    }
+
+    // 處理放開手指
+    function handleRelease() {
+        if (currentBlock) {
+            currentBlock.isFalling = true;
+            scoreBoard.innerText = "落下！";
+            // 這裡不將 currentBlock 設為 null，而是讓它進入 falling 狀態
+            // 等落地後再由 updateGamePhysics 處理
+        } else {
+             scoreBoard.innerText = "請捏合手指";
+        }
+    }
+
+    // 物理與繪圖
+    function updateGamePhysics() {
+        // 1. 處理正在落下的方塊 (Current Block Falling)
+        if (currentBlock && currentBlock.isFalling) {
+            const fallSpeed = 15;
+            currentBlock.y += fallSpeed;
+
+            // 檢查碰撞地面或下一個方塊
+            let landedY = canvasElement.height - 20; // 地面位置
+            
+            // 簡單的堆疊邏輯：檢查是否撞到 staticBlocks 中最高的那個
+            if (staticBlocks.length > 0) {
+                const topBlock = staticBlocks[staticBlocks.length - 1];
+                // 如果在下方塊的水平範圍內
+                if (currentBlock.x + currentBlock.width > topBlock.x && 
+                    currentBlock.x < topBlock.x + topBlock.width) {
+                    landedY = topBlock.y;
+                }
+            }
+
+            // 著地判斷
+            if (currentBlock.y + currentBlock.height >= landedY) {
+                currentBlock.y = landedY - currentBlock.height;
+                currentBlock.isFalling = false;
+                staticBlocks.push(currentBlock); // 加入靜態堆疊
+                currentBlock = null; // 重置當前方塊
+                score++;
+                scoreBoard.innerText = `高度: ${score} | 請再次捏合`;
+            }
+            
+            // 如果掉出畫面 (沒疊到)
+            if (currentBlock && currentBlock.y > canvasElement.height) {
+                scoreBoard.innerText = "方塊掉落！遊戲結束 (重新整理重來)";
+                currentBlock = null;
+                // 簡單重置
+                setTimeout(() => { staticBlocks = []; score = 0; }, 2000);
+            }
+        }
+    }
+
+    function drawBlocks() {
+        // 畫靜態方塊
+        staticBlocks.forEach(b => drawRect(b));
+        // 畫當前手上的/落下的方塊
+        if (currentBlock) drawRect(currentBlock);
+        
+        // 畫地板
+        canvasCtx.fillStyle = '#555';
+        canvasCtx.fillRect(0, canvasElement.height - 20, canvasElement.width, 20);
+    }
+
+    function drawRect(b) {
+        canvasCtx.fillStyle = b.color;
+        canvasCtx.strokeStyle = 'white';
+        canvasCtx.lineWidth = 2;
+        canvasCtx.fillRect(b.x, b.y, b.width, b.height);
+        canvasCtx.strokeRect(b.x, b.y, b.width, b.height);
+    }
+
+</script>
+</body>
+</html>
